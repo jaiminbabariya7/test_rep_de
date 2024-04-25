@@ -1,1 +1,1 @@
-# test_rep_de
+This is a test repository.
