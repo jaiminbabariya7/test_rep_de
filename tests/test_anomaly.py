@@ -1,0 +1,100 @@
+"""Unit tests for AnomalyDetector."""
+import unittest
+from unittest.mock import MagicMock
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__),'..'))
+
+from src.anomaly_detector import AnomalyDetector, Anomaly
+from src.data_profiler import ColumnProfile, TableProfile
+
+
+def _make_profile(null_rates=None, row_count=10000):
+    null_rates = null_rates or {}
+    cols = []
+    for name in ["order_id","amount","email"]:
+        nr = null_rates.get(name, 0.0)
+        cols.append(ColumnProfile(name=name, dtype="STRING" if name=="email" else "FLOAT64",
+                                   null_rate=nr, cardinality=100,
+                                   mean=50.0 if name=="amount" else None,
+                                   std=10.0  if name=="amount" else None,
+                                   p25=40.0  if name=="amount" else None,
+                                   p75=60.0  if name=="amount" else None,
+                                   min_val=5.0 if name=="amount" else None,
+                                   max_val=95.0 if name=="amount" else None))
+    return TableProfile(dataset="ecomm", table="orders",
+                        row_count=row_count,
+                        schema=[{"name":c.name,"type":c.dtype,"mode":"NULLABLE"} for c in cols],
+                        columns=cols)
+
+
+class TestNullRateDetection(unittest.TestCase):
+    def setUp(self):
+        mock_bq = MagicMock()
+        mock_bq.get_daily_row_counts.side_effect = Exception("skip")
+        self.detector = AnomalyDetector(connector=mock_bq)
+
+    def test_critical_null_rate_flagged(self):
+        profile = _make_profile(null_rates={"email": 0.25})
+        report  = self.detector.detect(profile)
+        critical = [a for a in report.anomalies if a.anomaly_type=="null_rate" and a.severity=="critical"]
+        self.assertTrue(any("email" in a.column for a in critical))
+
+    def test_medium_null_rate_flagged(self):
+        profile = _make_profile(null_rates={"email": 0.10})
+        report  = self.detector.detect(profile)
+        medium  = [a for a in report.anomalies if a.anomaly_type=="null_rate" and a.severity=="medium"]
+        self.assertTrue(any("email" in a.column for a in medium))
+
+    def test_clean_table_no_null_anomalies(self):
+        profile = _make_profile()
+        report  = self.detector.detect(profile)
+        null_anomalies = [a for a in report.anomalies if a.anomaly_type=="null_rate"]
+        self.assertEqual(len(null_anomalies), 0)
+
+
+class TestSchemaChange(unittest.TestCase):
+    def setUp(self):
+        mock_bq = MagicMock()
+        mock_bq.get_daily_row_counts.side_effect = Exception("skip")
+        self.detector = AnomalyDetector(connector=mock_bq)
+
+    def _schema(self, cols):
+        return [{"name": c, "type": "STRING", "mode": "NULLABLE"} for c in cols]
+
+    def test_added_column_detected(self):
+        curr = _make_profile(); curr.schema = self._schema(["a","b","c"])
+        prev = _make_profile(); prev.schema = self._schema(["a","b"])
+        report = self.detector.detect(curr, baseline=prev)
+        schema_changes = [a for a in report.anomalies if a.anomaly_type=="schema_change"]
+        self.assertTrue(any(a.column=="c" for a in schema_changes))
+
+    def test_removed_column_flagged_critical(self):
+        curr = _make_profile(); curr.schema = self._schema(["a","b"])
+        prev = _make_profile(); prev.schema = self._schema(["a","b","c"])
+        report = self.detector.detect(curr, baseline=prev)
+        removed = [a for a in report.anomalies if a.anomaly_type=="schema_change" and a.severity=="critical"]
+        self.assertTrue(any(a.column=="c" for a in removed))
+
+    def test_no_changes_no_anomalies(self):
+        curr = _make_profile(); curr.schema = self._schema(["a","b"])
+        prev = _make_profile(); prev.schema = self._schema(["a","b"])
+        report = self.detector.detect(curr, baseline=prev)
+        schema_changes = [a for a in report.anomalies if a.anomaly_type=="schema_change"]
+        self.assertEqual(len(schema_changes), 0)
+
+
+class TestAnomalyReport(unittest.TestCase):
+    def test_has_anomalies_false_when_empty(self):
+        from src.anomaly_detector import AnomalyReport
+        r = AnomalyReport(dataset="d", table="t", run_id="r1")
+        self.assertFalse(r.has_anomalies)
+
+    def test_critical_count_correct(self):
+        from src.anomaly_detector import AnomalyReport
+        r = AnomalyReport(dataset="d", table="t", run_id="r1",
+            anomalies=[Anomaly("null_rate","col","desc","critical"),
+                       Anomaly("null_rate","col","desc","medium")])
+        self.assertEqual(r.critical_count, 1)
+
+
+if __name__ == "__main__": unittest.main()
